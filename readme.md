@@ -137,6 +137,20 @@ Layer 4: ResidualBlock(256→512, stride=2) × 2
 AdaptiveAvgPool2d(1) → Dropout(0.4) → FC(512→10)
 ```
 
+**Penjelasan per-blok:**
+
+| Blok | Proses |
+|------|--------|
+| **Input (3×64×64)** | Citra satelit RGB masuk sebagai tensor 3 channel, ukuran 64×64 pixel |
+| **Stem Conv2d(3→64) + BN + ReLU** | Konvolusi awal mengekstrak 64 feature map dari raw pixel. Batch Norm menstabilkan distribusi aktivasi, ReLU menambah non-linearitas |
+| **Layer 1: ResidualBlock(64→64) × 2** | 2 blok residual tanpa downsampling — memperhalus fitur low-level (tepi, tekstur) sambil mempertahankan resolusi spasial |
+| **Layer 2: ResidualBlock(64→128, stride=2) × 2** | Channel naik 2× jadi 128, `stride=2` menyusutkan spatial map jadi 16×16 — model mulai belajar fitur mid-level (pola, bentuk) |
+| **Layer 3: ResidualBlock(128→256, stride=2) × 2** | Channel naik jadi 256, spatial 8×8 — fitur semakin abstrak dan semantik |
+| **Layer 4: ResidualBlock(256→512, stride=2) × 2** | Channel jadi 512, spatial 4×4 — representasi high-level (konsep kelas seperti "vegetasi", "bangunan") |
+| **AdaptiveAvgPool2d(1)** | Merata-ratakan seluruh spatial map → menghasilkan vektor 512-dimensi, invariant terhadap ukuran input |
+| **Dropout(0.4)** | Secara random mematikan 40% neuron saat training untuk mencegah overfitting |
+| **FC(512→10)** | Fully Connected layer yang memetakan 512 fitur ke 10 skor kelas (logits) |
+
 **Residual Block:**
 ```python
 class ResidualBlock(nn.Module):
@@ -144,6 +158,8 @@ class ResidualBlock(nn.Module):
     # + Skip Connection (dengan 1×1 Conv jika dimensi berbeda)
     # → ReLU
 ```
+
+> **Kenapa Residual Block?** Skip connection (`x + F(x)`) memungkinkan gradient mengalir langsung ke layer awal, menghindari *vanishing gradient* saat training model yang dalam.
 
 | Parameter | Nilai |
 |-----------|-------|
@@ -178,12 +194,31 @@ Head: Conv(320→1280) + BN + SiLU
       + AdaptiveAvgPool → Dropout(0.3) → FC(1280→10)
 ```
 
+**Penjelasan per-blok:**
+
+| Blok | Proses |
+|------|--------|
+| **Stem Conv2d(3→32) + BN + SiLU** | Ekstraksi fitur awal lebih ringan (32 channel vs 64 di ResNet). SiLU (`x·σ(x)`) lebih smooth dari ReLU, cocok untuk model yang lebih dalam |
+| **MBConv(32→16, expand=1)** | Tanpa ekspansi channel — langsung kompres 32→16. Bottleneck awal untuk efisiensi komputasi |
+| **MBConv expand=6 (sisanya)** | Channel di-expand 6× secara internal sebelum diproses, menangkap lebih banyak fitur, lalu dikompres lagi ke output channel |
+| **stride=2 (layer 3, 4, 6)** | Downsampling spasial — mengurangi resolusi sambil menambah kedalaman representasi fitur |
+| **Head Conv(320→1280) + BN + SiLU** | Proyeksi akhir ke ruang 1280-dimensi yang lebih kaya sebelum klasifikasi |
+| **AdaptiveAvgPool → Dropout(0.3) → FC(1280→10)** | Global pooling → regularisasi → klasifikasi ke 10 kelas |
+
 **MBConv Block (Mobile Inverted Residual + Squeeze-Excite):**
 ```python
 Expand (1×1 Conv) → Depthwise Conv (3×3) →
 Squeeze-Excite (channel attention) → Pointwise Conv (1×1)
 + Residual jika in_ch == out_ch dan stride == 1
 ```
+
+| Tahap MBConv | Fungsi |
+|---|---|
+| **Expand (1×1 Conv)** | Naikkan channel ×expand_ratio untuk memperluas ruang fitur |
+| **Depthwise Conv (3×3)** | Konvolusi per-channel secara terpisah — jauh lebih hemat komputasi dari conv biasa |
+| **Squeeze-Excite** | *Channel attention*: model belajar bobot kepentingan tiap channel secara adaptif |
+| **Pointwise Conv (1×1)** | Kembalikan channel ke ukuran output yang dituju |
+| **Residual** | Tambahkan input asal (hanya jika dimensi sama dan stride=1) untuk menjaga informasi asli |
 
 | Parameter | Nilai |
 |-----------|-------|
@@ -212,23 +247,48 @@ Squeeze-Excite (channel attention) → Pointwise Conv (1×1)
 |--|--------|--------------|
 | **Training Curve** | ![ResNet History](outputs_resnet/training_history.png) | ![EfficientNet History](outputs_efficient/training_history.png) |
 
+**Hasil Training Curve:**
+- Grafik menampilkan **Loss** dan **F1 Score** untuk data train (oranye) dan validasi (biru) selama 40 epoch
+- **Diagonal ideal:** train loss turun → val loss ikut turun tanpa gap besar (tidak overfitting)
+- **Gap besar** antara train dan val = tanda overfitting
+- EfficientNet dengan `OneCycleLR` cenderung konvergen lebih cepat dan smooth; ResNet dengan `CosineAnnealingLR` lebih gradual
+- Model terbaik disimpan otomatis di epoch di mana **val F1 tertinggi** dicapai
+
 ### Confusion Matrix
 
 | | ResNet | EfficientNet |
 |--|--------|--------------|
 | **Confusion Matrix** | ![ResNet CM](outputs_resnet/confusion_matrix.png) | ![EfficientNet CM](outputs_efficient/confusion_matrix.png) |
 
+**Hasil Confusion Matrix:**
+- Grid 10×10: **baris** = kelas aktual, **kolom** = kelas prediksi model
+- **Diagonal utama** (warna gelap) = prediksi **benar** — semakin terang diagonal, semakin akurat
+- **Di luar diagonal** = salah klasifikasi; semakin gelap = semakin sering keliru ke kelas itu
+- Contoh: banyak `HerbaceousVegetation` diprediksi sebagai `Forest` → sel off-diagonal di baris `HerbaceousVegetation` kolom `Forest` akan tinggi
+
 ### Perbandingan Confusion Matrix (Error Analysis)
 
 ![Confusion Compare](error_analysis_outputs/01_confusion_compare.png)
+
+**Hasil yang bisa dibaca:**
+- ResNet (biru) dan EfficientNet (hijau) ditampilkan berdampingan untuk perbandingan langsung
+- Model dengan diagonal lebih "bersih" (sedikit noise di luar diagonal) = lebih akurat secara keseluruhan
+- Jika kedua model membuat error di kelas yang **sama** → pertanda kelas itu memang ambigu secara visual
+- Jika hanya satu model yang error → kemungkinan arsitektur satunya lebih cocok untuk kelas tersebut
 
 ### Per-Class F1 Score
 
 ![Per-Class F1](error_analysis_outputs/02_perclass_f1.png)
 
+**Hasil Per-Class F1 Score:**
+- Bar chart grouped per kelas — **biru = ResNet**, **hijau = EfficientNet**
+- Sumbu Y = F1 Score (0–1); semakin tinggi semakin baik
+- F1 Score menggabungkan **Precision** (ketepatan) dan **Recall** (kelengkapan) dalam satu angka
+
 **Observasi:**
-- Kedua model kesulitan pada kelas `HerbaceousVegetation` — mirip secara visual dengan `Forest` dan `Pasture`
-- `SeaLake` dan `Industrial` adalah kelas yang paling mudah diprediksi di kedua model
+- `SeaLake` dan `Industrial` → F1 mendekati 1.0 di kedua model — paling mudah diprediksi karena fitur visualnya unik (badan air besar, bangunan industri)
+- `HerbaceousVegetation` → F1 paling rendah (~0.65–0.8) karena mirip secara visual dengan `Forest` dan `Pasture`
+- ResNet umumnya sedikit lebih unggul di kelas-kelas yang sulit, sementara EfficientNet lebih efisien dengan parameter 3× lebih sedikit
 
 ### Sampel Misklasifikasi
 
@@ -236,11 +296,22 @@ Squeeze-Excite (channel attention) → Pointwise Conv (1×1)
 |--------|--------------|
 | ![Misclassified ResNet](error_analysis_outputs/03_misclassified_resnet.png) | ![Misclassified EfficientNet](error_analysis_outputs/03_misclassified_efficientnet.png) |
 
+**Hasil Sampel Misklasifikasi:**
+- Setiap gambar ditampilkan beserta **label asli** (ground truth) dan **label prediksi** model
+- Berguna untuk analisis kualitatif: apakah gambar memang ambigu secara visual, atau model jelas salah?
+- Jika gambar yang salah tampak mirip antar kelas → wajar; jika perbedaan kelas sangat jelas tapi model salah → indikasi model masih perlu belajar lebih baik
+
 ### Most Confused Pairs
 
 | ResNet | EfficientNet |
 |--------|--------------|
 | ![Confused Pairs ResNet](error_analysis_outputs/04_confused_pairs_resnet.png) | ![Confused Pairs EfficientNet](error_analysis_outputs/04_confused_pairs_efficientnet.png) |
+
+**Hasil Most Confused Pairs:**
+- Menampilkan **pasangan kelas yang paling sering tertukar** satu sama lain, diurutkan dari yang paling sering
+- Pasangan dengan konfusi tertinggi: `HerbaceousVegetation↔Forest`, `AnnualCrop↔PermanentCrop`, `River↔SeaLake`
+- Konsisten dengan temuan EDA (bagian 1) — kelas-kelas ini memang memiliki kemiripan visual tinggi sejak awal
+- Informasi ini berguna untuk menentukan strategi lanjutan: augmentasi khusus atau fine-tuning pada pasangan kelas sulit tersebut
 
 ---
 
